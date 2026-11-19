@@ -1,0 +1,280 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- GLOBAL HELPERS ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function storeDoc(storeId) {
+      return get(/databases/$(database)/documents/stores/$(storeId));
+    }
+
+    function isStoreOwner(storeId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/stores/$(storeId)) &&
+        storeDoc(storeId).data.ownerId == request.auth.uid;
+    }
+
+    function isStoreMember(storeId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/stores/$(storeId)) &&
+        (storeDoc(storeId).data.ownerId == request.auth.uid ||
+         request.auth.uid in storeDoc(storeId).data.memberUids);
+    }
+
+    // --- VALIDATION HELPERS ---
+    function isValidUserProfile(data) {
+      return (!('email' in data) || (data.email is string && data.email.size() <= 256)) &&
+             (!('storeId' in data) || (data.storeId is string && data.storeId.size() <= 128)) &&
+             (!('role' in data) || (data.role is string && data.role.size() <= 64)) &&
+             (!('isSimpleMode' in data) || data.isSimpleMode is bool) &&
+             (!('simpleMode' in data) || data.simpleMode is bool) &&
+             (!('createdAt' in data) || data.createdAt == null || (data.createdAt is timestamp && data.createdAt <= request.time)) &&
+             (!('updatedAt' in data) || data.updatedAt == null || (data.updatedAt is timestamp && data.updatedAt <= request.time));
+    }
+
+    function isValidStore(data) {
+      return data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+             data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+             data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 100 &&
+             (!('phone' in data) || (data.phone is string && data.phone.size() <= 64)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 300)) &&
+             (!('shopType' in data) || (data.shopType is string && data.shopType.size() <= 64)) &&
+             (!('productCategories' in data) || (data.productCategories is list && data.productCategories.size() <= 100)) &&
+             (!('members' in data) || (data.members is list && data.members.size() <= 100));
+    }
+
+    function isValidStoreInvite(data) {
+      return data.code is string && data.code.size() >= 4 && data.code.size() <= 32 &&
+             data.storeId is string && isValidId(data.storeId) &&
+             data.status is string && data.status in ['active', 'pending', 'used', 'cancelled'] &&
+             data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128 &&
+             (!('staffName' in data) || (data.staffName is string && data.staffName.size() <= 120)) &&
+             (!('roleLabel' in data) || (data.roleLabel is string && data.roleLabel.size() <= 64)) &&
+             (!('permissionLevel' in data) || (data.permissionLevel is string && data.permissionLevel.size() <= 64));
+    }
+
+    function isValidStoreMember(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.role is string && data.role.size() >= 1 && data.role.size() <= 64 &&
+             data.status is string && data.status.size() >= 1 && data.status.size() <= 32 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120)) &&
+             (!('email' in data) || (data.email is string && data.email.size() <= 256));
+    }
+
+    function isValidPrivateAiKey(data, storeId) {
+      return data.storeId is string && data.storeId == storeId &&
+             data.apiKey is string && data.apiKey.size() >= 10 && data.apiKey.size() <= 256 &&
+             data.keyLast4 is string && data.keyLast4.size() == 4 &&
+             data.updatedBy is string && data.updatedBy == request.auth.uid;
+    }
+
+    function isValidStoreRecord(data) {
+      return data is map && data.size() <= 80;
+    }
+
+    // --- USERS COLLECTION ---
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       request.auth.uid == userId &&
+                       isValidUserProfile(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidUserProfile(incoming()) &&
+                       (
+                         request.auth.uid == userId ||
+                         (
+                           existing().storeId is string &&
+                           existing().storeId.size() > 0 &&
+                           isStoreOwner(existing().storeId) &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['storeId', 'role', 'updatedAt']) &&
+                           incoming().storeId == ''
+                         )
+                       );
+
+      allow delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+    }
+
+    // --- INVITES COLLECTION ---
+    match /invites/{inviteCode} {
+      allow get: if isSignedIn() && isValidId(inviteCode);
+      allow list: if isSignedIn() &&
+                     existing().createdByUid == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(inviteCode) &&
+                       isValidStoreInvite(incoming()) &&
+                       incoming().code == inviteCode &&
+                       incoming().createdByUid == request.auth.uid &&
+                       incoming().status in ['active', 'pending'] &&
+                       isStoreOwner(incoming().storeId);
+
+      allow update: if isSignedIn() &&
+                       isValidId(inviteCode) &&
+                       isValidStoreInvite(incoming()) &&
+                       incoming().storeId == existing().storeId &&
+                       incoming().code == existing().code &&
+                       incoming().createdByUid == existing().createdByUid &&
+                       (
+                         (
+                           isStoreOwner(existing().storeId) &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                         ) ||
+                         (
+                           existing().status in ['active', 'pending'] &&
+                           incoming().status == 'used' &&
+                           incoming().usedByUid == request.auth.uid &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'usedByUid', 'usedByEmail', 'usedAt', 'updatedAt'])
+                         )
+                       );
+
+      allow delete: if isSignedIn() && isValidId(inviteCode) && isStoreOwner(existing().storeId);
+    }
+
+    // --- STORES COLLECTION ---
+    match /stores/{storeId} {
+      allow get: if isSignedIn() &&
+                    isValidId(storeId) &&
+                    (existing().ownerId == request.auth.uid || request.auth.uid in existing().memberUids);
+
+      allow list: if isSignedIn() &&
+                     (existing().ownerId == request.auth.uid || request.auth.uid in existing().memberUids);
+
+      allow create: if isSignedIn() &&
+                       isValidId(storeId) &&
+                       isValidStore(incoming()) &&
+                       incoming().ownerId == request.auth.uid &&
+                       request.auth.uid in incoming().memberUids;
+
+      allow update: if isSignedIn() &&
+                       isValidId(storeId) &&
+                       isValidStore(incoming()) &&
+                       incoming().ownerId == existing().ownerId &&
+                       (
+                         existing().ownerId == request.auth.uid ||
+                         (
+                           request.auth.uid in existing().memberUids &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'address', 'shopType', 'productCategories', 'updatedAt'])
+                         ) ||
+                         (
+                           incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedAt']) &&
+                           request.auth.uid in incoming().memberUids &&
+                           incoming().memberUids.size() == existing().memberUids.size() + 1 &&
+                           existsAfter(/databases/$(database)/documents/stores/$(storeId)/members/$(request.auth.uid))
+                         )
+                       );
+
+      allow delete: if isSignedIn() && isValidId(storeId) && existing().ownerId == request.auth.uid;
+
+      // Owner-only private secrets (e.g. Gemini API key)
+      match /private/{docId} {
+        allow get: if isSignedIn() && isValidId(docId) && isStoreOwner(storeId);
+        allow list: if false;
+        allow create, update: if isSignedIn() &&
+                                 isValidId(docId) &&
+                                 isValidPrivateAiKey(incoming(), storeId) &&
+                                 isStoreOwner(storeId);
+        allow delete: if isSignedIn() && isValidId(docId) && isStoreOwner(storeId);
+      }
+
+      // Store staff & owner members
+      match /members/{memberId} {
+        allow get: if isSignedIn() &&
+                      isValidId(memberId) &&
+                      (request.auth.uid == memberId || isStoreMember(storeId));
+        allow list: if isSignedIn() && isStoreMember(storeId);
+
+        allow create: if isSignedIn() &&
+                         isValidId(memberId) &&
+                         isValidStoreMember(incoming()) &&
+                         incoming().userId == memberId &&
+                         (
+                           isStoreOwner(storeId) ||
+                           (
+                             request.auth.uid == memberId &&
+                             incoming().role != 'owner'
+                           )
+                         );
+
+        allow update: if isSignedIn() &&
+                         isValidId(memberId) &&
+                         isValidStoreMember(incoming()) &&
+                         incoming().userId == existing().userId &&
+                         isStoreOwner(storeId);
+
+        allow delete: if isSignedIn() && isValidId(memberId) && isStoreOwner(storeId);
+      }
+
+      // Operational store subcollections (member-scoped)
+      match /{subcollection}/{docId} {
+        allow get: if isSignedIn() &&
+                      subcollection in [
+                        'products', 'productBin', 'customers', 'suppliers',
+                        'sales', 'purchases', 'purchaseReturns', 'payments',
+                        'supplierPayments', 'accounts', 'accountAdjustments',
+                        'expenses', 'otherIncomes', 'categories', 'notes',
+                        'healthFixLogs', 'meta', 'strategy'
+                      ] &&
+                      isValidId(docId) &&
+                      isStoreMember(storeId);
+
+        allow list: if isSignedIn() &&
+                       subcollection in [
+                         'products', 'productBin', 'customers', 'suppliers',
+                         'sales', 'purchases', 'purchaseReturns', 'payments',
+                         'supplierPayments', 'accounts', 'accountAdjustments',
+                         'expenses', 'otherIncomes', 'categories', 'notes',
+                         'healthFixLogs', 'meta', 'strategy'
+                       ] &&
+                       isStoreMember(storeId);
+
+        allow create, update: if isSignedIn() &&
+                                 subcollection in [
+                                   'products', 'productBin', 'customers', 'suppliers',
+                                   'sales', 'purchases', 'purchaseReturns', 'payments',
+                                   'supplierPayments', 'accounts', 'accountAdjustments',
+                                   'expenses', 'otherIncomes', 'categories', 'notes',
+                                   'healthFixLogs', 'meta', 'strategy'
+                                 ] &&
+                                 isValidId(docId) &&
+                                 isValidStoreRecord(incoming()) &&
+                                 isStoreMember(storeId);
+
+        allow delete: if isSignedIn() &&
+                         subcollection in [
+                           'products', 'productBin', 'customers', 'suppliers',
+                           'sales', 'purchases', 'purchaseReturns', 'payments',
+                           'supplierPayments', 'accounts', 'accountAdjustments',
+                           'expenses', 'otherIncomes', 'categories', 'notes',
+                           'healthFixLogs', 'meta', 'strategy'
+                         ] &&
+                         isValidId(docId) &&
+                         isStoreMember(storeId);
+      }
+    }
+  }
+}
